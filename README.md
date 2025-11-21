@@ -5,6 +5,9 @@ and BME280
     Ding Yimei
 
 http://192.168.X.X/json	SensorValues
+
 http://192.168.X.X/info	Systeminfo
+
 http://192.168.X.X/reboot	restart
+
 http://192.168.X.X/update	OTA Firmware
