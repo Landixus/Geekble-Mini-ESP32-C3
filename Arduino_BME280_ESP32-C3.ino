@@ -1,4 +1,9 @@
 #include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiUdp.h>
+#include <ESPmDNS.h>
+#include <Update.h>
+
 #include <PubSubClient.h>
 #include <Wire.h>
 #include <Adafruit_BME280.h>
@@ -10,22 +15,25 @@
 #define SCL_PIN 9
 
 // ---- USER SETTINGS ----
-const char* ssid     = "SESSIONID";
-const char* password = "WIFI PASSWORD";
+const char* ssid     = "YOUR_SSID";
+const char* password = "YOUR_WIFIPASS";
 
-const char* mqtt_server = "192.168.0.155"; //your mqtt server 
-const int   mqtt_port   = 1883; // standard
-const char* mqtt_user   = "your_mqttuser";
-const char* mqtt_pass   = "your_pass";
+const char* mqtt_server = "192.168.0.155";  //change here?
+const int   mqtt_port   = 1883;
+const char* mqtt_user   = "mqtt";
+const char* mqtt_pass   = "YOUR_MQTT_PASS";
 
-String deviceName = "esp32_bme280";
-int telePeriod = 10;   // Sekunden
+String deviceName = "esp32_bme280_Innen";
+int telePeriod = 300;   // Sekunden  // its enough to know the data any 5 minutes.
 
 // ---- GLOBALS ----
 Adafruit_BME280 bme;
 WiFiClient espClient;
 PubSubClient client(espClient);
+WebServer server(80);
+
 unsigned long lastTele = 0;
+unsigned long bootTime = millis();
 
 // ----------------------------------------------------
 void setup_wifi() {
@@ -56,23 +64,6 @@ void initTime() {
   Serial.println("\nTime synced.");
 }
 
-// ----------------------------------------------------
-void reconnect() {
-  while (!client.connected()) {
-    Serial.print("Connecting MQTT... ");
-    String clientId = "ESP32C3-" + String(random(0xffff), HEX);
-
-    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
-      Serial.println("OK");
-    } else {
-      Serial.print("Failed rc=");
-      Serial.println(client.state());
-      delay(2000);
-    }
-  }
-}
-
-// ----------------------------------------------------
 String getTimeString() {
   time_t now = time(nullptr);
   struct tm* t = localtime(&now);
@@ -87,6 +78,21 @@ String getTimeString() {
            t->tm_sec);
 
   return String(buf);
+}
+
+// ----------------------------------------------------
+void reconnect() {
+  while (!client.connected()) {
+    String clientId = "esp32_bme280_Innen";  // feste ID
+
+    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
+      Serial.println("MQTT connected.");
+    } else {
+      Serial.print("Failed rc=");
+      Serial.println(client.state());
+      delay(2000);
+    }
+  }
 }
 
 // ----------------------------------------------------
@@ -114,6 +120,88 @@ void publishSensorData() {
 }
 
 // ----------------------------------------------------
+// WEB API ENDPOINTS
+// ----------------------------------------------------
+
+void handleJSON() {
+  StaticJsonDocument<256> doc;
+
+  doc["Time"] = getTimeString();
+  JsonObject BME = doc.createNestedObject("BME280");
+  BME["Temperature"] = bme.readTemperature();
+  BME["Humidity"]    = bme.readHumidity();
+  BME["Pressure"]    = bme.readPressure() / 100.0F;
+
+  String json;
+  serializeJsonPretty(doc, json);
+  server.send(200, "application/json", json);
+}
+
+void handleInfo() {
+  StaticJsonDocument<256> doc;
+
+  doc["Device"] = deviceName;
+  doc["IP"] = WiFi.localIP().toString();
+  doc["RSSI"] = WiFi.RSSI();
+  doc["Uptime_s"] = (millis() - bootTime) / 1000;
+  doc["Time"] = getTimeString();
+
+  String json;
+  serializeJsonPretty(doc, json);
+  server.send(200, "application/json", json);
+}
+
+void handleReboot() {
+  server.send(200, "text/plain", "Rebooting...");
+  delay(500);
+  ESP.restart();
+}
+
+// OTA Upload Form
+const char* updateForm =
+"<form method='POST' action='/update' enctype='multipart/form-data'>"
+"<input type='file' name='update'>"
+"<input type='submit' value='Update'>"
+"</form>";
+
+void handleUpdateForm() {
+  server.send(200, "text/html", updateForm);
+}
+
+void handleUpdate() {
+  HTTPUpload& upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    Serial.setDebugOutput(true);
+    Update.begin();
+    Serial.printf("Update: %s\n", upload.filename.c_str());
+  } 
+  else if (upload.status == UPLOAD_FILE_WRITE) {
+    Update.write(upload.buf, upload.currentSize);
+  } 
+  else if (upload.status == UPLOAD_FILE_END) {
+    Update.end(true);
+    Serial.printf("Update Success\n");
+  }
+}
+
+void setupServer() {
+  server.on("/", [](){ server.send(200, "text/plain", "ESP32-C3 OK"); });
+  server.on("/json", handleJSON);
+  server.on("/info", handleInfo);
+  server.on("/reboot", handleReboot);
+
+  // OTA
+  server.on("/update", HTTP_GET, handleUpdateForm);
+  server.on("/update", HTTP_POST, []() {
+    server.send(200, "text/plain", Update.hasError() ? "FAIL" : "OK");
+  }, handleUpdate);
+
+  server.begin();
+  Serial.println("Web server running.");
+}
+
+// ----------------------------------------------------
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -123,7 +211,6 @@ void setup() {
 
   Serial.println("Initializing BME280...");
 
-  // Sicherer Init-Block
   if (!bme.begin(0x76)) {
     if (!bme.begin(0x77)) {
       if (!bme.begin()) {
@@ -139,11 +226,15 @@ void setup() {
   initTime();
   client.setServer(mqtt_server, mqtt_port);
 
+  setupServer();
+
   Serial.println("Setup fertig.");
 }
 
 // ----------------------------------------------------
 void loop() {
+  server.handleClient();
+
   if (!client.connected()) reconnect();
   client.loop();
 
